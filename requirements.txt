@@ -1,5 +1,9 @@
 confluent-kafka
 celery
+redis
 fastapi
 uvicorn
 requests
+Pillow
+numpy
+imgbeddings

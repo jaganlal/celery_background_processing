@@ -6,30 +6,27 @@ config = {
   'group.id': 'my_group',
   'auto.offset.reset': 'earliest'
 }
-def consume_from_kafka():
-  consumer = Consumer(**config)
-  consumer.subscribe(['my_test_topic'])
 
-  try:
-    while True:
-      msg = consumer.poll(1.0)
+consumer = Consumer(**config)
+consumer.subscribe(['my_test_topic'])
 
-      if msg is None:
-        continue
-      if msg.error():
-        if msg.error().code() == KafkaException._PARTITION_EOF:
-            continue
-        else:
-            print(msg.error())
-            break
+try:
+  while True:
+    msg = consumer.poll(0.1)
 
-      print(f"Consumed message: {msg.value().decode('utf-8')}")
-      process_message.delay(msg.value().decode('utf-8'))
-      # process_message(msg.value().decode('utf-8'))
-  except Exception as e:
-    print(f"Error while consuming: {e}")
-  finally:
-    consumer.close()
+    if msg is None:
+      continue
+    if msg.error():
+      if msg.error().code() == KafkaException._PARTITION_EOF:
+          continue
+      else:
+          print(msg.error())
+          break
 
-if __name__ == "__main__":
-  consume_from_kafka()
+    print(f"Consumed message: {msg.value().decode('utf-8')}")
+    t = process_message.delay(msg.value().decode('utf-8'))
+    print(f"Status: {t.status}")
+except Exception as e:
+  print(f"Error while consuming: {e}")
+finally:
+  consumer.close()

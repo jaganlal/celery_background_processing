@@ -33,6 +33,20 @@
             "env": {
                 "PYTHONPATH": "${cwd}"
             },
+        },
+        {
+            "name": "Celery",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "celery",
+            "console": "integratedTerminal",
+            "args": [
+                "-A",
+                "worker",
+                "worker",
+                "--loglevel",
+                "info"
+            ]
         }
     ]
 }

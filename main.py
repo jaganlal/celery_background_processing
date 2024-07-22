@@ -1,29 +1,20 @@
-from contextlib import asynccontextmanager
-import time
-# from tasks import io_bound_task, collect_results
-from producer import produce_message
-from celery import chord
-# from consumer import init_consumer, BackgroundRunner, init_consumer_v1
-import celery.states
-from celery.result import AsyncResult
 from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+from confluent_kafka import Producer, Consumer, KafkaError
+from celery.result import AsyncResult
+from celery import Celery
+import json
+import requests
+from io import BytesIO
+from PIL import Image
+import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
-import asyncio
-from threading import Thread
 
-consumer_thread = None
+# from imgbeddings import imgbeddings
 
-@asynccontextmanager
-async def app_lifespan(app: FastAPI):
-    print("init lifespan")
-    # code to execute when app is loading
-    # start_background_consumer()
-    # asyncio.create_task(consume_messages())
-    yield
-    # code to execute when app is shutting down
-
-app = FastAPI(lifespan=app_lifespan)
-
+ibed = None
+# ibed = imgbeddings()
+app = FastAPI()
 app.add_middleware(
   CORSMiddleware,
   allow_origins=["*"],
@@ -32,63 +23,96 @@ app.add_middleware(
   allow_headers=["*"],
 )
 
-@app.get("/api/1.0/process_message")
-def process_message():
-  topic = 'my_test_topic'
-  message = 'my new test message'
-  produce_message(topic, message)
+KAFKA_TOPIC = "image_ingestion"
+KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+LOG_IMAGES_URL = "http://localhost:8000/log_images"  # Adjust this URL to match your logging endpoint
 
-@app.get("/api/{task_id}/status")
-async def status(task_id: str) -> dict:
-  res = AsyncResult(task_id)
-  if res.state == celery.states.SUCCESS:
-    return {'state': celery.states.SUCCESS,
-            'result': res.result}
-  return {'state': res.state, }
+producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
 
+celery_app = Celery(
+    'tasks', 
+    broker='confluentkafka://localhost:9092',
+    backend='redis://localhost:6379/0'
+)
 
-# @app.get("/sequential")
-# def sequential_task():
-#   start_time = time.time()
-#   urls = ["https://httpbin.org/delay/3" for n in range(10)]
-#   results = []
-#   for url in urls:
-#     results.append(io_bound_task(url))
-#   end_time = time.time()
-#   return {"status": results, "time_taken": end_time - start_time}
+class ImageIngestionRequest(BaseModel):
+    request_id: str
+    images: list[str]
+class LogImagesRequest(BaseModel):
+    request_id: str
+    embeddings: list
 
-# @app.get("/sequential_celery")
-# def celery_task():
-#   start_time = time.time()
-#   urls = ["https://httpbin.org/delay/3" for n in range(10)]
-#   tasks = [io_bound_task.s(url) for url in urls]
-#   callback = chord(tasks)(collect_results.s(start_time))
-#   return {"task_id": callback.id}
+@app.post("/ingest_images/")
+async def ingest_images(request: ImageIngestionRequest, background_tasks: BackgroundTasks):
+    message = {
+        "request_id": request.request_id,
+        "images": request.images
+    }
+    producer.produce(KAFKA_TOPIC, json.dumps(message).encode('utf-8'))
+    producer.flush()
+    background_tasks.add_task(process_image_embeddings, request.request_id)
+    return {"message": "Images ingestion started"}
 
+@celery_app.task
+def process_image_embeddings(request_id):
+    consumer = Consumer({
+        'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+        'group.id': 'image_processor_group',
+        'auto.offset.reset': 'earliest'
+    })
+    consumer.subscribe([KAFKA_TOPIC])
+    embeddings = [0, 1]
 
-# @app.get("/result/{task_id}")
-# def get_result(task_id: str):
-#   task = collect_results.AsyncResult(task_id)
-#   if task.state == 'PENDING':
-#     return {"status": "Task is still in progress", "state": task.state}
-#   elif task.state != 'FAILURE':
-#     return task.result
-#   else:
-#     return {"status": "Task failed", "state": task.state, "error": str(task.info)}
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(msg.error())
+                break
 
-def start_background_consumer():
-  # background_tasks = BackgroundTasks()
-  # background_tasks.add_task(init_consumer)
-  
-  # asyncio.create_task(init_consumer())
+        message = json.loads(msg.value().decode('utf-8'))
+        if message['request_id'] == request_id:
+            for image_url in message['images']:
+                result = generate_image_embedding.delay(image_url)
+                embedding = result.get()  # This blocks until the task is completed, which is not ideal for large batches
+                embeddings.append(embedding)
+            break
 
-  # runner = BackgroundRunner()
-  # asyncio.create_task(runner.run_main())
+    consumer.close()
 
-  # background_tasks = BackgroundTasks()
-  # runner = BackgroundRunner()
-  # background_tasks.add_task(runner.run_main())
+    # Send embeddings to the log_images endpoint
+    response = requests.post(LOG_IMAGES_URL, json={"request_id": request_id, "embeddings": embeddings})
+    return response.status_code
 
-  global consumer_thread
-  consumer_thread = Thread(target=init_consumer_v1)
-  consumer_thread.start()
+@celery_app.task
+def generate_image_embedding(image_url):
+    print(f"Image URL: %s" % image_url)
+    embedding = []
+
+    # try:
+    #   response = requests.get(image_url)
+
+    #   image = Image.open(BytesIO(response.content))
+    #   vector = ibed.to_embeddings(image)
+    #   embedding = np.array(vector[0])
+    # except Exception as e:
+    #     print(f"Error is %s" % e)
+    
+
+    # image = Image.open(BytesIO(response.content))
+    # embedding = np.array([0.5] * 128)  # Placeholder for actual embedding generation
+    return embedding
+
+@app.post("/log_images/")
+async def log_images(request: LogImagesRequest):
+    # Logic to handle logging of image embeddings
+    print(f"Received embeddings for request_id: {request.request_id}")
+    return {"message": "Embeddings logged successfully"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
